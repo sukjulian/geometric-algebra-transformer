@@ -54,9 +54,9 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "einops",
-        "numpy<1.25",
-        "opt_einsum @ git+https://github.com/dgasmith/opt_einsum.git@1a984b7b75f3e532e7129f6aa13f7ddc3da66e10",
-        "torch>=2.0",
+        "numpy",
+        "opt_einsum",
+        "torch",
         "xformers",
     ],
 )
