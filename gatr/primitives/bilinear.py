@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+import gatr.primitives.ops as ops
 from gatr.utils.einsum import gatr_cache, gatr_einsum
 
 _FILENAMES = {"gp": "geometric_product.pt", "outer": "outer_product.pt"}
@@ -49,9 +50,9 @@ def geometric_product(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     Parameters
     ----------
     x : torch.Tensor with shape (..., 16)
-        First input multivector. Batch dimensions must be broadcastable between x and y.
+        First input multivector. Batch dimensions must coincide between x and y.
     y : torch.Tensor with shape (..., 16)
-        Second input multivector. Batch dimensions must be broadcastable between x and y.
+        Second input multivector. Batch dimensions must coincide between x and y.
 
     Returns
     -------
@@ -59,11 +60,20 @@ def geometric_product(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         Result. Batch dimensions are result of broadcasting between x, y, and coeffs.
     """
 
-    # Select kernel on correct device
-    gp = _load_bilinear_basis("gp", x.device, x.dtype)
+    if x.dim() == 2:
+        x = x.unsqueeze(1)
+
+    if y.dim() == 2:
+        y = y.unsqueeze(1)
+
+    assert x.dim() == y.dim() == 3, "Dimensions mismatch."
+
+    x = x.movedim(2, 0)
+    y = y.movedim(2, 0)
 
     # Compute geometric product
-    outputs = gatr_einsum("i j k, ... j, ... k -> ... i", gp, x, y)
+    outputs = ops.geometric_product(x, y)
+    outputs = outputs.movedim(0, 2).squeeze()
 
     return outputs
 
