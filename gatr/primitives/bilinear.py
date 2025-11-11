@@ -60,6 +60,7 @@ def geometric_product(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         Result. Batch dimensions are result of broadcasting between x, y, and coeffs.
     """
 
+    # Dynamically dispatch to Triton if possible
     if x.dim() == y.dim() == 3:
         x = x.movedim(2, 0).contiguous()
         y = y.movedim(2, 0).contiguous()
