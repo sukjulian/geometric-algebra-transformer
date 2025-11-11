@@ -861,6 +861,7 @@ class GeometricProduct(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        assert x.is_contiguous() and y.is_contiguous(), "Tensors required to be contiguous."
 
         outputs = geometric_product_forward(x, y)
         ctx.save_for_backward(x, y)
@@ -869,6 +870,7 @@ class GeometricProduct(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        grad_outputs = grad_outputs.contiguous()
 
         x, y = ctx.saved_tensors
         grad_x, grad_y = geometric_product_backward(x, y, grad_outputs)
@@ -880,56 +882,131 @@ def geometric_product(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return GeometricProduct.apply(x, y)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # run with CUDA_LAUNCH_BLOCKING=1
 
+    from statistics import mean
     from time import time
+
+    from prettytable import PrettyTable
+    from torch.cuda.memory import max_memory_allocated, reset_peak_memory_stats
+    from torch.nn.functional import mse_loss
+    from tqdm import tqdm
 
     from gatr.primitives.bilinear import _load_bilinear_basis
     from gatr.utils.einsum import gatr_einsum
 
-    def time_(fun, *args):
+    def profile(fun, *args):
+        reset_peak_memory_stats()
 
         t0 = time()
         outputs = fun(*args)
         t1 = time()
 
-        print(f"{round(t1 - t0, 4)} s ({fun.__name__})")
+        return t1 - t0, max_memory_allocated(), outputs
 
-        return outputs
-
-    # shape = (16, 2**20, 2**5)  # triton
-    shape = (16, 2**17, 2**5)  # einsum
-    x = torch.rand(shape, dtype=torch.double, device="cuda", requires_grad=True)
-    y = torch.rand(shape, dtype=torch.double, device="cuda", requires_grad=True)
+    # Verify correctness
+    shape = (2**4, 2**17, 2**5)  # num_dim, num_pos, num_channels
+    kwargs = {"dtype": torch.double, "device": "cuda", "requires_grad": True}
+    x, y = torch.rand(shape, **kwargs), torch.rand(shape, **kwargs)
     target = torch.rand(shape, dtype=torch.double, device="cuda")
 
     # Triton
-    x.retain_grad()
-    y.retain_grad()
+    x.retain_grad(), y.retain_grad()
+    outputs_triton = geometric_product(x, y)
 
-    outputs_triton = time_(geometric_product, x, y)
-    time_(torch.nn.functional.mse_loss(outputs_triton, target).backward)
+    mse_loss(outputs_triton, target).backward()
+    grad_x_triton, grad_y_triton = x.grad, y.grad
 
-    grad_x_triton = x.grad
-    grad_y_triton = y.grad
-    x.grad = None
-    y.grad = None
+    # Reset gradients
+    x.grad, y.grad = None, None
 
     # Einsum
     gp = _load_bilinear_basis("gp", x.device, x.dtype).double()
-    x = x.movedim(0, 2)
-    y = y.movedim(0, 2)
+    x, y = x.movedim(0, 2), y.movedim(0, 2)
+    x.retain_grad(), y.retain_grad()
+    outputs_einsum = gatr_einsum("i j k, ... j, ... k -> ... i", gp, x, y).movedim(2, 0)
 
-    x.retain_grad()
-    y.retain_grad()
+    mse_loss(outputs_einsum, target).backward()
+    grad_x_einsum, grad_y_einsum = x.grad.movedim(2, 0), y.grad.movedim(2, 0)
 
-    outputs_einsum = time_(gatr_einsum, "i j k, ... j, ... k -> ... i", gp, x, y)
-    outputs_einsum = outputs_einsum.movedim(2, 0)
-    time_(torch.nn.functional.mse_loss(outputs_einsum, target).backward)
+    assert torch.allclose(outputs_triton, outputs_einsum), "Forward incorrect."
+    assert torch.allclose(grad_x_triton, grad_x_einsum) and torch.allclose(
+        grad_y_triton, grad_y_einsum
+    ), "Backward incorrect."
 
-    grad_x_einsum = x.grad.movedim(2, 0)
-    grad_y_einsum = y.grad.movedim(2, 0)
+    # Compare performance
+    table_runtime = PrettyTable(
+        ["Points", "triton (f) [s]", "einsum (f) [s]", "triton (b) [s]", "einsum (b) [s]"]
+    )
+    table_memory = PrettyTable(
+        ["Points", "triton (f) [MB]", "einsum (f) [MB]", "triton (b) [MB]", "einsum (b) [MB]"]
+    )
+    for num_pos in tqdm(torch.logspace(15, 18, 4, base=2, dtype=torch.int), leave=False):
+        runtime_triton_forward, runtime_triton_backward = [], []
+        runtime_einsum_forward, runtime_einsum_backward = [], []
+        memory_triton_forward, memory_triton_backward = [], []
+        memory_einsum_forward, memory_einsum_backward = [], []
+        for _ in tqdm(range(64), leave=False):
+            shape = (2**4, num_pos, 2**5)
+            kwargs = {"device": "cuda", "requires_grad": True}
+            x, y = torch.rand(shape, **kwargs), torch.rand(shape, **kwargs)
+            target = torch.rand(shape, device="cuda")
 
-    print((outputs_triton - outputs_einsum).abs().max().item())
-    print((grad_x_triton - grad_x_einsum).abs().max().item())
-    print((grad_y_triton - grad_y_einsum).abs().max().item())
+            # Triton
+            runtime, memory, outputs = profile(geometric_product, x, y)
+            runtime_triton_forward.append(runtime)
+            memory_triton_forward.append(memory)
+
+            runtime, memory, _ = profile(mse_loss(outputs, target).backward)
+            runtime_triton_backward.append(runtime)
+            memory_triton_backward.append(memory)
+
+            # Reset gradients
+            x.grad, y.grad = None, None
+
+            # Einsum
+            x, y = x.movedim(0, 2), y.movedim(0, 2)
+            x.retain_grad(), y.retain_grad()
+            runtime, memory, outputs = profile(
+                gatr_einsum, "i j k, ... j, ... k -> ... i", gp.float(), x, y
+            )
+            runtime_einsum_forward.append(runtime)
+            memory_einsum_forward.append(memory)
+
+            outputs = outputs.movedim(2, 0)
+            runtime, memory, _ = profile(mse_loss(outputs, target).backward)
+            runtime_einsum_backward.append(runtime)
+            memory_einsum_backward.append(memory)
+
+        # Average runtime
+        table_runtime.add_row(
+            [
+                num_pos.item(),
+                *[
+                    round(mean(samples), 4)
+                    for samples in (
+                        runtime_triton_forward,
+                        runtime_einsum_forward,
+                        runtime_triton_backward,
+                        runtime_einsum_backward,
+                    )
+                ],
+            ]
+        )
+        table_memory.add_row(
+            [
+                num_pos.item(),
+                *[
+                    round(mean(samples) * 1e-6)
+                    for samples in (
+                        memory_triton_forward,
+                        memory_einsum_forward,
+                        memory_triton_backward,
+                        memory_einsum_backward,
+                    )
+                ],
+            ]
+        )
+
+    print(table_runtime)
+    print(table_memory)
