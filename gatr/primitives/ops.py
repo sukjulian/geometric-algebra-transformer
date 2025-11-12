@@ -882,13 +882,13 @@ def geometric_product(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return GeometricProduct.apply(x, y)
 
 
-if __name__ == "__main__":  # run with CUDA_LAUNCH_BLOCKING=1
+if __name__ == "__main__":
 
-    from statistics import mean
-    from time import time
+    from statistics import median
 
     from prettytable import PrettyTable
-    from torch.cuda.memory import max_memory_allocated, reset_peak_memory_stats
+    from torch.cuda import Event, synchronize
+    from torch.cuda.memory import empty_cache, max_memory_allocated, reset_peak_memory_stats
     from torch.nn.functional import mse_loss
     from tqdm import tqdm
 
@@ -896,13 +896,19 @@ if __name__ == "__main__":  # run with CUDA_LAUNCH_BLOCKING=1
     from gatr.utils.einsum import gatr_einsum
 
     def profile(fun, *args):
-        reset_peak_memory_stats()
+        start = Event(enable_timing=True)
+        stop = Event(enable_timing=True)
+        reset_peak_memory_stats(), empty_cache()
 
-        t0 = time()
+        start.record()
         outputs = fun(*args)
-        t1 = time()
+        stop.record()
 
-        return t1 - t0, max_memory_allocated(), outputs
+        synchronize()
+        runtime = start.elapsed_time(stop)
+        memory = max_memory_allocated()
+
+        return runtime, memory, outputs
 
     # Verify correctness
     shape = (2**4, 2**17, 2**5)  # num_dim, num_pos, num_channels
@@ -983,7 +989,7 @@ if __name__ == "__main__":  # run with CUDA_LAUNCH_BLOCKING=1
             [
                 num_pos.item(),
                 *[
-                    round(mean(samples), 4)
+                    round(median(samples) * 1e-3, 4)  # [ms] to [s]
                     for samples in (
                         runtime_triton_forward,
                         runtime_einsum_forward,
@@ -997,7 +1003,7 @@ if __name__ == "__main__":  # run with CUDA_LAUNCH_BLOCKING=1
             [
                 num_pos.item(),
                 *[
-                    round(mean(samples) * 1e-6)
+                    round(median(samples) * 1e-6)  # [B] to [MB]
                     for samples in (
                         memory_triton_forward,
                         memory_einsum_forward,
