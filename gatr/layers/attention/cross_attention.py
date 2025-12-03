@@ -10,6 +10,7 @@ from torch import nn
 
 from gatr.layers.attention.attention import GeometricAttention
 from gatr.layers.attention.config import SelfAttentionConfig
+from gatr.layers.attention.positional_encoding import ApplyRotaryPositionalEncoding
 from gatr.layers.dropout import GradeDropout
 from gatr.layers.linear import EquiLinear
 
@@ -42,11 +43,6 @@ class CrossAttention(nn.Module):
 
         if config.additional_qk_mv_channels > 0 or config.additional_qk_s_channels > 0:
             raise NotImplementedError("Cross attention is not implemented with additional channels")
-
-        if config.pos_encoding:
-            raise NotImplementedError(
-                "Cross attention is not implemented with positional encoding."
-            )
 
         # Store settings
         self.config = config
@@ -83,6 +79,15 @@ class CrossAttention(nn.Module):
             out_s_channels=config.out_s_channels,
             initialization=config.output_init,
         )
+
+        # Optional positional encoding
+        self.pos_encoding: nn.Module
+        if config.pos_encoding:
+            self.pos_encoding = ApplyRotaryPositionalEncoding(
+                config.hidden_s_channels, item_dim=-2, base=config.pos_enc_base
+            )
+        else:
+            self.pos_encoding = nn.Identity()
 
         # Attention
         self.attention = GeometricAttention(config)
@@ -156,6 +161,10 @@ class CrossAttention(nn.Module):
             v_s = rearrange(v_s, "... items hidden_channels -> ... 1 items hidden_channels")
         else:
             q_s, k_s, v_s = None, None, None
+
+        # Rotary positional encoding
+        q_s = self.pos_encoding(q_s)
+        k_s = self.pos_encoding(k_s)
 
         # Attention layer
         h_mv, h_s = self.attention(q_mv, k_mv, v_mv, q_s, k_s, v_s, attention_mask=attention_mask)

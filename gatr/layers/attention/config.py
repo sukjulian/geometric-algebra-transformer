@@ -92,7 +92,7 @@ class SelfAttentionConfig:
         # It also should not be too small.
         if self.pos_encoding:
             hidden_s_channels = (hidden_s_channels + 1) // 2 * 2
-            hidden_s_channels = max(hidden_s_channels, 8)
+            hidden_s_channels = max(hidden_s_channels, 16)
 
         return hidden_s_channels
 
